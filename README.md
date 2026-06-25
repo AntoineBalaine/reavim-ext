@@ -123,16 +123,13 @@ repetitions = 5
 
 ## Build
 
+Requires zig 0.14.x. Use `build-install.sh` to build and deploy in one step:
+
 ```sh
-zig build                      # → zig-out/reaper_reavim.so
-zig build test
+./build-install.sh                        # uses 'zig' from PATH
+./build-install.sh -z /path/to/zig-0.14  # explicit compiler
 ```
 
-Zig 0.14.1 (a toolchain lives at `/tank/projects/.toolchains/zig-x86_64-linux-0.14.1/`).
-Deploy by copying `zig-out/reaper_reavim.so` to REAPER's `UserPlugins` directory and
-restarting REAPER.
-
-## Changelog
-
-0.1.1
-Add the readme in the release - with install instructions
+This installs the plugin into REAPER's `UserPlugins` directory and the default
+`bindings.ini` into `Data/Perken/`, both derived from the REAPER resource path.
+On macOS it also launches a fresh REAPER instance after the install.

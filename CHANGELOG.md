@@ -1,5 +1,18 @@
 # Changelog
 
+## [v0.1.4]
+
+### Added
+- Macro recording now shows a colored `● REC @<reg>` indicator in the status line instead of plain `REC`
+- Whichkey action labels now fill the actual column pixel width (measured via `CalcTextSize`) instead of truncating at a fixed character count
+- New bindings under `<space>o`: `of` SoloInFront, `og` ToggleGridLines, `oM` ToggleMasterMonoStereo, `oT` ToggleTrimContentBehindItems
+- New bindings under `<space>t`: `ts` ToggleSoloTracks, `tS` ToggleSoloDefeat, `to` MoveTracksToFolder, `tw` MakeFolder, `ta` ShowAllTracks
+- `build-install.sh`: build and install script with zig 0.14.x version guard (`-z` flag to override compiler path) and prefix-based install for the plugin and keybindings
+
+### Fixed
+- Macro recording: pressing `q` no longer fires immediately with no register — the engine waits for the register key before acting, while a bare press during recording still acts as the stop toggle
+- `RepeatLastCommand` (`.`) now correctly replays `PlayMacro` by routing it through `meta.handle` instead of `runner.execute`; `PlayMacro` now sets `last_command` so `.` has something to replay
+
 ## [v0.1.3]
 
 ### Fixed
