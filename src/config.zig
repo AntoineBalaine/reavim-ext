@@ -17,6 +17,7 @@ const grammar = @import("grammar.zig");
 const actions = @import("actions.zig");
 const builder = @import("builder.zig");
 const lib_state = @import("lib_state.zig");
+const batch_rename = @import("batch_rename.zig");
 
 const log = std.log.scoped(.config);
 
@@ -27,6 +28,13 @@ pub const Bindings = struct {
     /// in the engine — they are not regular bindings, so they work mid-sequence.
     page_next: keymod.Key = .{ .vk = keymod.VK.NEXT }, // PageDown
     page_prev: keymod.Key = .{ .vk = keymod.VK.PRIOR }, // PageUp
+    /// Batch-rename launcher (the [rename] config section). The terminal
+    /// command receives the editor script as its last argument.
+    rename_terminal: []const u8 = batch_rename.default_terminal,
+    /// An empty editor selects the user's $VISUAL / $EDITOR (vim fallback).
+    rename_editor: []const u8 = batch_rename.default_editor,
+    /// Close the Terminal.app window once the editor exits (macOS only).
+    rename_close_terminal: bool = batch_rename.default_close_terminal,
 
     pub fn deinit(self: *Bindings) void {
         for (&self.tables.tries) |*row| for (row) |*t| t.deinit();
@@ -37,8 +45,18 @@ pub const Bindings = struct {
 const CurSection = union(enum) {
     binding: Section,
     whichkey,
+    rename,
     unknown,
 };
+
+/// Parses a boolean setting: true/false, yes/no, on/off or 1/0.
+fn parseBool(v: []const u8) ?bool {
+    const truthy = [_][]const u8{ "true", "yes", "on", "1" };
+    const falsy = [_][]const u8{ "false", "no", "off", "0" };
+    for (truthy) |t| if (std.ascii.eqlIgnoreCase(v, t)) return true;
+    for (falsy) |f| if (std.ascii.eqlIgnoreCase(v, f)) return false;
+    return null;
+}
 
 /// Parses a single-key value like "<pagedown>" or "<C-n>" for [whichkey].
 fn parseSingleKey(raw: []const u8) ?keymod.Key {
@@ -135,7 +153,7 @@ pub fn parse(
 ) !Bindings {
     var b = Bindings{
         .arena = std.heap.ArenaAllocator.init(gpa),
-        .tables = undefined,
+        .tables = .{ .tries = undefined },
     };
     errdefer b.arena.deinit();
     for (&b.tables.tries) |*row| for (row) |*t| {
@@ -162,6 +180,8 @@ pub fn parse(
             .section => |name| {
                 if (std.mem.eql(u8, name, "whichkey")) {
                     section = .whichkey;
+                } else if (std.mem.eql(u8, name, "rename")) {
+                    section = .rename;
                 } else if (parseSectionName(name)) |sec| {
                     section = .{ .binding = sec };
                 } else {
@@ -182,6 +202,25 @@ pub fn parse(
                         b.page_prev = key;
                     } else {
                         log.warn("unknown [whichkey] key '{s}' — skipped", .{kv.key});
+                    }
+                },
+                .rename => {
+                    const v = std.mem.trim(u8, kv.value, " \t");
+                    if (v.len == 0) {
+                        log.warn("empty [rename] value for '{s}' — skipped", .{kv.key});
+                        continue;
+                    }
+                    if (std.mem.eql(u8, kv.key, "terminal")) {
+                        b.rename_terminal = try arena.dupe(u8, v);
+                    } else if (std.mem.eql(u8, kv.key, "editor")) {
+                        b.rename_editor = try arena.dupe(u8, v);
+                    } else if (std.mem.eql(u8, kv.key, "close_terminal")) {
+                        b.rename_close_terminal = parseBool(v) orelse {
+                            log.warn("bad [rename] close_terminal '{s}' (use true/false) — skipped", .{v});
+                            continue;
+                        };
+                    } else {
+                        log.warn("unknown [rename] key '{s}' — skipped", .{kv.key});
                     }
                 },
                 .binding => |sec| {
@@ -227,6 +266,9 @@ pub fn parse(
         }
     }
 
+    if (registry.get("CurrentTrack")) |def| {
+        b.tables.current_track = .{ .name = "CurrentTrack", .def = def };
+    }
     return b;
 }
 
@@ -241,6 +283,29 @@ const test_defs = [_]actions.Entry{
     .{ .name = "NextTrack", .def = .{ .steps = &.{.{ .cmd = 40285 }}, .prefix_repetition_count = true } },
     .{ .name = "RemoveTracks", .def = .{ .steps = &.{.{ .cmd = 40005 }} } },
 };
+
+test "rename settings default and override" {
+    var reg = try actions.Registry.init(std.testing.allocator, &.{});
+    defer reg.deinit();
+
+    var d = try parseString(std.testing.allocator, &reg, "[main.command]\nj = 40285\n");
+    defer d.deinit();
+    try std.testing.expectEqualStrings(batch_rename.default_terminal, d.rename_terminal);
+    try std.testing.expectEqualStrings("", d.rename_editor);
+    try std.testing.expectEqual(batch_rename.default_close_terminal, d.rename_close_terminal);
+
+    var o = try parseString(std.testing.allocator, &reg,
+        \\[rename]
+        \\terminal = open -a iTerm
+        \\editor = nvim -u NONE
+        \\close_terminal = false
+        \\
+    );
+    defer o.deinit();
+    try std.testing.expectEqualStrings("open -a iTerm", o.rename_terminal);
+    try std.testing.expectEqualStrings("nvim -u NONE", o.rename_editor);
+    try std.testing.expect(!o.rename_close_terminal);
+}
 
 test "whichkey pagination keys default and override" {
     var reg = try actions.Registry.init(std.testing.allocator, &.{});

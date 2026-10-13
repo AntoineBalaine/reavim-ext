@@ -1,6 +1,9 @@
 //! Feedback window: dockable ReaImGui window showing mode, pending keys,
 //! and completion hints. Timer-driven, Console1-style; ImGui init is deferred
-//! to the first tick where the window is needed (ReaImGui may load after us).
+//! to REAPER's first post-boot timer tick, since register() runs inside
+//! ReaperPluginEntry during REAPER's plugin-load phase -- before REAPER's
+//! main loop starts and before other extensions' own ReaperPluginEntry
+//! calls are guaranteed to have run yet.
 //! Colors are Console1's main palette (reaperConsole1 default_reaper_theme.ini).
 const std = @import("std");
 const Reaper = @import("reaper").reaper;
@@ -10,24 +13,36 @@ const config = @import("config.zig");
 const keymod = @import("key.zig");
 const meta = @import("meta.zig");
 const utils = @import("utils");
+const actions = @import("actions.zig");
+const builder = @import("builder.zig");
+const grammar = @import("grammar.zig");
+const search = @import("search.zig");
+const state = @import("state.zig");
 
 const log = std.log.scoped(.extension);
 
-var imgui_available = false; // set once at register()
+/// Because ReaImGui may load after us, its API can only be probed once boot
+/// is done, so the state starts `unchecked` and the first timer tick resolves
+/// it to `absent` or `present`.
+var imgui_state: enum { unchecked, absent, present } = .unchecked;
 var ctx: imgui.ContextPtr = null;
 var font: imgui.FontPtr = null;
 var hidden = false;
 var prev_mode: vim.Mode = .off;
+/// Whether ImGui reported the whichkey window as focused on the last frame.
+/// The vim engine reads it to redirect keys typed into the window back to the
+/// arrange view, because those keys would otherwise be swallowed silently.
+pub var window_focused = false;
 
 /// Show/hide the feedback window (bindable action). No-op without ReaImGui.
 pub fn toggleVisible() bool {
-    if (!imgui_available) return false;
+    if (imgui_state != .present) return false;
     hidden = !hidden;
     return !hidden;
 }
 
 pub fn isVisible() bool {
-    return imgui_available and !hidden;
+    return imgui_state == .present and !hidden;
 }
 
 const FONT_SIZE: c_int = 14;
@@ -46,28 +61,217 @@ const col_frame_bg = rgba(0x333333FF);
 const col_accent = rgba(0xFF00A5FF); // ActiveToggle
 const col_green = rgba(0x13BD99FF); // ButtonActive
 const col_key = rgba(0xC1FFE1FF); // ButtonHovered, opaque
+const col_accent_dim = rgba(0xFF00A566); // accent at 40% for text selection
 
-/// Resolve ReaImGui once at load. The feedback window is optional: if ReaImGui
-/// isn't installed, set the flag and never subscribe the timer — the extension
-/// runs fully without any UI. (reavim's plugin file sorts after
-/// reaper_imgui-*, so ReaImGui's API is already registered by the time this
-/// runs when it is installed.)
+/// Always subscribe the timer. ReaImGui availability is resolved lazily on
+/// the first timer tick instead of here (see ensureImguiChecked) -- REAPER
+/// only starts delivering timer callbacks once every plugin has finished
+/// loading and the main loop is running, which makes the first onTimer call
+/// a reliable, order-independent "boot is done" signal.
 pub fn register() void {
-    imgui.init(Reaper.plugin_getapi) catch {
-        log.warn("ReaImGui not available — feedback window disabled (install via ReaPack)", .{});
-        return;
-    };
-    imgui_available = true;
     _ = Reaper.plugin_register("timer", @constCast(@ptrCast(&onTimer)));
 }
 
 pub fn unregister() void {
-    if (!imgui_available) return;
     _ = Reaper.plugin_register("-timer", @constCast(@ptrCast(&onTimer)));
 }
 
 pub fn available() bool {
-    return imgui_available;
+    return imgui_state == .present;
+}
+
+// ---- binding search (pinned at the top of the window) ----
+
+pub const MAX_RESULTS = 512;
+const RESULT_ROWS: usize = 10;
+const QUERY_LEN = 128;
+
+pub const SearchState = struct {
+    /// Set by the SearchBindings action: the vim engine then routes typed
+    /// keys into the query, so the arrange view keeps keyboard focus.
+    capturing: bool = false,
+    /// Whether the ImGui text field itself is being edited (after a mouse
+    /// click). The engine must then let keys reach the field.
+    input_active: bool = false,
+    query: [QUERY_LEN:0]u8 = [_:0]u8{0} ** QUERY_LEN,
+    selected: usize = 0,
+    index: ?search.Index = null,
+    results: [MAX_RESULTS]usize = undefined,
+    results_len: usize = 0,
+
+    pub fn queryText(self: *const SearchState) []const u8 {
+        return std.mem.sliceTo(&self.query, 0);
+    }
+
+    pub fn active(self: *const SearchState) bool {
+        return self.capturing or self.input_active or self.queryText().len > 0;
+    }
+};
+
+pub var search_state: SearchState = .{};
+
+/// The index descriptions use the same names as the whichkey grid.
+fn searchDesc(value: builder.BindingValue, context: grammar.Context, buf: [:0]u8) []const u8 {
+    return displayName(value, context, buf);
+}
+
+/// Rebuilds the index when it is missing or was built for another context
+/// or mode, then recomputes the results for the current query.
+pub fn refreshResults() void {
+    const tables = vim.tables() orelse return;
+    const ctx_now = vim.activeContext();
+    const mode_now = state.grammarMode();
+    if (search_state.index == null) search_state.index = search.Index.init(std.heap.c_allocator);
+    const index = &search_state.index.?;
+    if (index.entries.items.len == 0 or index.ctx != ctx_now or index.mode != mode_now) {
+        search.rebuild(index, tables, ctx_now, mode_now, &searchDesc) catch |err| {
+            log.warn("search index failed: {s}", .{@errorName(err)});
+            return;
+        };
+    }
+    search_state.results_len = search.filter(index, search_state.queryText(), &search_state.results).len;
+    if (search_state.selected >= search_state.results_len)
+        search_state.selected = if (search_state.results_len == 0) 0 else search_state.results_len - 1;
+}
+
+/// Opens the search box with typing captured by vim (the SearchBindings
+/// action). The window is shown and unfolded, because the box lives in it.
+/// Without ReaImGui, the box would never be drawn while vim still swallowed
+/// every key into it, so the action does nothing in that case.
+pub fn openSearch() void {
+    if (imgui_state != .present) return;
+    hidden = false;
+    folded = false;
+    search_state.capturing = true;
+    search_state.query[0] = 0;
+    search_state.selected = 0;
+    refreshResults();
+}
+
+pub fn closeSearch() void {
+    search_state.capturing = false;
+    search_state.query[0] = 0;
+    search_state.selected = 0;
+    search_state.results_len = 0;
+}
+
+/// Runs the result at `slot` (an index into the current results) by feeding
+/// its key sequence to the engine.
+pub fn runResult(slot: usize) void {
+    if (slot >= search_state.results_len) return;
+    const index = &(search_state.index orelse return);
+    const entry = index.entries.items[search_state.results[slot]];
+    const was_in_field = search_state.input_active;
+    closeSearch();
+    if (was_in_field) vim.focusArrange();
+    vim.feedKeys(entry.keys);
+}
+
+pub fn moveSelection(delta: isize) void {
+    if (search_state.results_len == 0) return;
+    const n: isize = @intCast(search_state.results_len);
+    const cur: isize = @intCast(search_state.selected);
+    search_state.selected = @intCast(@mod(cur + delta, n));
+}
+
+/// Handles one key-down while vim captures typing for the search box.
+pub fn searchKey(k: keymod.Key) void {
+    const plain = !k.ctrl and !k.alt and !k.shift and !k.is_char;
+    if (plain and k.vk == keymod.VK.ESCAPE) return closeSearch();
+    if (plain and k.vk == keymod.VK.RETURN) return runResult(search_state.selected);
+    if (plain and (k.vk == keymod.VK.UP)) return moveSelection(-1);
+    if (plain and (k.vk == keymod.VK.DOWN or k.vk == keymod.VK.TAB)) return moveSelection(1);
+    if (k.ctrl and !k.alt and !k.is_char and (k.vk == 'P' or k.vk == 'K')) return moveSelection(-1);
+    if (k.ctrl and !k.alt and !k.is_char and (k.vk == 'N' or k.vk == 'J')) return moveSelection(1);
+    if (plain and k.vk == keymod.VK.BACK) {
+        const len = search_state.queryText().len;
+        if (len > 0) search_state.query[len - 1] = 0;
+        search_state.selected = 0;
+        return refreshResults();
+    }
+    const c = search.keyChar(k) orelse return;
+    const len = search_state.queryText().len;
+    if (len + 1 >= QUERY_LEN) return;
+    search_state.query[len] = c;
+    search_state.query[len + 1] = 0;
+    search_state.selected = 0;
+    refreshResults();
+}
+
+fn searchBindingsAction(_: *actions.RunCtx) void {
+    openSearch();
+}
+
+pub const entries = [_]actions.Entry{
+    .{ .name = "SearchBindings", .def = .{ .steps = &.{.{ .func = &searchBindingsAction }}, .desc = "Search keys & commands" } },
+};
+
+/// The search box row. While vim captures typing, the field gets the accent
+/// border, because the arrange view keeps keyboard focus and the user needs
+/// to see where the typing goes.
+fn renderSearchBox() void {
+    const capturing = search_state.capturing;
+    // The field sets every color it uses, because the inherited defaults gave
+    // dark text on the dark frame: typed text uses the bright key color, the
+    // hint the regular text color, on a frame lighter than the window. While
+    // vim captures typing, the accent border shows where the keys go.
+    const field_colors = [_]struct { col: *c_int, val: c_int }{
+        .{ .col = &imgui.Col_Text, .val = col_key },
+        .{ .col = &imgui.Col_TextDisabled, .val = col_text },
+        .{ .col = &imgui.Col_FrameBg, .val = col_title_bg },
+        .{ .col = &imgui.Col_FrameBgHovered, .val = col_title_bg_active },
+        .{ .col = &imgui.Col_FrameBgActive, .val = col_title_bg_active },
+        .{ .col = &imgui.Col_TextSelectedBg, .val = col_accent_dim },
+        .{ .col = &imgui.Col_Border, .val = if (capturing) col_accent else col_border },
+    };
+    inline for (field_colors) |fc| imgui.api.PushStyleColor(ctx, fc.col.*, fc.val);
+    imgui.api.PushStyleVar(ctx, imgui.StyleVar_FrameBorderSize, if (capturing) 1 else 0, null);
+
+    imgui.api.SetNextItemWidth(ctx, -std.math.floatMin(f64));
+    const before_len = search_state.queryText().len;
+    var flags: c_int = imgui.InputTextFlags_EnterReturnsTrue | imgui.InputTextFlags_AutoSelectAll;
+    const hint: [*:0]const u8 = if (capturing)
+        "type to search, Up/Down to select, Enter to run, Esc to close"
+    else
+        "search keys & commands (<space>/)";
+    const entered = imgui.api.InputTextWithHint(ctx, "##reavim_search", hint, &search_state.query, QUERY_LEN, &flags, null);
+    search_state.input_active = imgui.api.IsItemActive(ctx);
+
+    imgui.api.PopStyleVar(ctx, null);
+    var n_colors: c_int = field_colors.len;
+    imgui.api.PopStyleColor(ctx, &n_colors);
+
+    if (search_state.input_active) {
+        // Mouse-focused editing: the field owns the keyboard, so the result
+        // navigation keys are read from ImGui instead of the vim engine.
+        if (search_state.queryText().len != before_len) search_state.selected = 0;
+        if (imgui.api.IsKeyPressed(ctx, imgui.Key_UpArrow, null)) moveSelection(-1);
+        if (imgui.api.IsKeyPressed(ctx, imgui.Key_DownArrow, null)) moveSelection(1);
+    }
+    if (search_state.active()) refreshResults();
+    if (entered) runResult(search_state.selected);
+}
+
+fn renderSearchResults() void {
+    var line: [256:0]u8 = undefined;
+    const index = &(search_state.index orelse return);
+    const n = search_state.results_len;
+    if (n == 0) {
+        if (search_state.queryText().len > 0) imgui.api.Text(ctx, "no match");
+        return;
+    }
+    // The visible window of rows follows the selection.
+    const first = if (search_state.selected >= RESULT_ROWS) search_state.selected + 1 - RESULT_ROWS else 0;
+    const last = @min(n, first + RESULT_ROWS);
+    var slot = first;
+    while (slot < last) : (slot += 1) {
+        const e = index.entries.items[search_state.results[slot]];
+        var selected = slot == search_state.selected;
+        const label = utils.safePrint(&line, "{s: >10}   {s}##sr{d}", .{ e.keys_text, e.desc, slot });
+        if (imgui.api.Selectable(ctx, label, &selected, null, null, null)) runResult(slot);
+    }
+    const pos = utils.safePrint(&line, "{d}/{d}", .{ search_state.selected + 1, n });
+    textColored(ctx, col_text, pos);
 }
 
 /// Action display name, reavim-style: real action names instead of raw ids.
@@ -190,10 +394,16 @@ fn keyLessThan(_: void, a: vim.Completion, b: vim.Completion) bool {
 }
 
 fn onTimer() callconv(.C) void {
+    ensureImguiChecked();
+    if (imgui_state != .present) return;
+
     if (vim.mode() != .off and prev_mode == .off) hidden = false;
     prev_mode = vim.mode();
 
-    if (hidden) return;
+    if (hidden) {
+        window_focused = false;
+        return;
+    }
 
     if (ctx == null) {
         var cfg_flags: c_int = imgui.ConfigFlags_DockingEnable;
@@ -221,10 +431,31 @@ fn onTimer() callconv(.C) void {
     var is_open: bool = true;
     var begin_flags: c_int = imgui.WindowFlags_NoSavedSettings;
     const visible = imgui.api.Begin(ctx, "ReaVim", &is_open, &begin_flags);
+    var focus_flags: c_int = imgui.FocusedFlags_RootAndChildWindows;
+    window_focused = visible and imgui.api.IsWindowFocused(ctx, &focus_flags);
     if (visible) renderContent();
     imgui.api.End(ctx);
 
-    if (!is_open) hidden = true;
+    if (!is_open) {
+        hidden = true;
+        window_focused = false;
+    }
+}
+
+/// Resolve the ReaImGui API exactly once, on REAPER's first post-boot timer
+/// tick. Safe to call unconditionally from onTimer every frame; the state
+/// makes this a no-op after the first call. Because the timer has no other
+/// use when ReaImGui is absent, we unregister it in that case so that the
+/// extension does not pay for a callback on every main-loop tick.
+fn ensureImguiChecked() void {
+    if (imgui_state != .unchecked) return;
+    imgui.init(Reaper.plugin_getapi) catch {
+        log.warn("ReaImGui not available — feedback window disabled (install via ReaPack)", .{});
+        imgui_state = .absent;
+        _ = Reaper.plugin_register("-timer", @constCast(@ptrCast(&onTimer)));
+        return;
+    };
+    imgui_state = .present;
 }
 
 fn renderContent() void {
@@ -250,7 +481,10 @@ fn renderContent() void {
     imgui.api.SameLine(ctx, null, null);
     textColored(ctx, mode_col, mode_txt);
 
-    if (m == .off) return;
+    if (m == .off) {
+        if (search_state.capturing) closeSearch();
+        return;
+    }
 
     imgui.api.SameLine(ctx, null, null);
     var pbuf: [96]u8 = undefined;
@@ -273,6 +507,13 @@ fn renderContent() void {
     }
 
     if (folded) return;
+
+    renderSearchBox();
+    if (search_state.active()) {
+        last_n_pages = 1;
+        renderSearchResults();
+        return;
+    }
 
     if (m == .insert) {
         last_n_pages = 1;

@@ -194,6 +194,41 @@ fn focusHandlesOwnKeys(msg: *accel.MSG) bool {
     return false;
 }
 
+/// ReaImGui windows (ours and other scripts') carry these class names.
+fn isImGuiClass(cls: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(cls, "REAIMGUI_") or
+        std.mem.eql(u8, cls, "reaper_imgui_context");
+}
+
+/// The whichkey window gives no visual cue that it holds keyboard focus, so
+/// keys typed into it would be lost from the user's point of view. Because of
+/// that, a key destined for a ReaImGui window while our whichkey reports focus
+/// is treated as a key for the arrange view. Requiring both conditions keeps
+/// keys typed into other scripts' ReaImGui windows untouched.
+fn keyTargetsWhichkey(msg: *accel.MSG) bool {
+    // The search box edited with the mouse-focused text field must receive
+    // its own keys, so the redirect stays off while that field is active.
+    if (!ui.window_focused or ui.search_state.input_active) return false;
+    var buf: [64]u8 = undefined;
+    if (msg.hwnd) |h| {
+        if (isImGuiClass(swell.getClassName(h, &buf))) return true;
+    }
+    var fbuf: [64]u8 = undefined;
+    if (swell.getFocus()) |f| {
+        if (isImGuiClass(swell.getClassName(f, &fbuf))) return true;
+    }
+    return false;
+}
+
+/// Hands keyboard focus back to the arrange view (the main window's child with
+/// control id 1000), so that the following keys reach it directly.
+pub fn focusArrange() void {
+    const main_hwnd = Reaper.GetMainHwnd();
+    const arrange = swell.getDlgItem(main_hwnd, 1000) orelse main_hwnd;
+    swell.setFocus(arrange);
+    ui.window_focused = false;
+}
+
 /// Returns the translateAccel return value: 0 = pass through, 1 = eat.
 pub fn onKey(msg: *accel.MSG) c_int {
     if (state.mode == .off) return 0;
@@ -205,8 +240,14 @@ pub fn onKey(msg: *accel.MSG) c_int {
     const vk: u8 = @truncate(msg.wParam);
     if (vk == VK_SHIFT or vk == VK_CONTROL or vk == VK_MENU) return 0;
 
-    if (!focusInScope(msg)) return 0;
-    if (focusHandlesOwnKeys(msg)) return 0;
+    if (keyTargetsWhichkey(msg)) {
+        // Only the key-down moves focus; the key-up of the same key then
+        // arrives in the arrange view, where it is handled normally.
+        if (down) focusArrange();
+    } else {
+        if (!focusInScope(msg)) return 0;
+        if (focusHandlesOwnKeys(msg)) return 0;
+    }
 
     // SWELL packs the win32 ACCEL modifier mask into lParam; FVIRTKEY
     // distinguishes virtual-key codes from raw ASCII punctuation chars.
@@ -241,6 +282,16 @@ pub fn onKey(msg: *accel.MSG) c_int {
     // reached when a dialog/control has focus (the guards above pass those
     // through), so the action list keeps its own PageDown/PageUp.
     const k = keymod.fromEvent(vk, virt, mods.shift, mods.ctrl, mods.alt);
+
+    // While the search box captures typing, every key edits the query or
+    // drives the result list instead of the vim grammar. As elsewhere, only
+    // the key-ups of plain keys are eaten, because their downs were eaten.
+    if (ui.search_state.capturing) {
+        if (up) return if (mods.ctrl or mods.alt) 0 else 1;
+        ui.searchKey(k);
+        return 1;
+    }
+
     if (k.eql(b.page_next) or k.eql(b.page_prev)) {
         if (down) {
             if (k.eql(b.page_next)) ui.pageNext() else ui.pagePrev();
@@ -267,6 +318,14 @@ pub fn onKey(msg: *accel.MSG) c_int {
     // Key-ups: eat plain ones (their downs were eaten), pass modified ones.
     if (up) return if (mods.ctrl or mods.alt) 0 else 1;
 
+    return pushKey(b, ctx, k, mods.ctrl or mods.alt);
+}
+
+/// Appends one key to the pending sequence and builds, runs, or keeps
+/// waiting on it. Returns the translateAccel value (0 = pass through).
+/// `modified` lets an unbound ctrl/alt combo at the start of a sequence pass
+/// through to REAPER's own keymap.
+pub fn pushKey(b: *config.Bindings, ctx: Context, k: keymod.Key, modified: bool) c_int {
     if (key_len >= key_buf.len) clearPending();
     key_buf[key_len] = k;
     key_len += 1;
@@ -307,8 +366,23 @@ pub fn onKey(msg: *accel.MSG) c_int {
     // Undefined sequence.
     const was_start = key_len == 1;
     clearPending();
-    if (was_start and (mods.ctrl or mods.alt)) return 0;
+    if (was_start and modified) return 0;
     return 1;
+}
+
+/// Runs a whole key sequence as if it had been typed in the active context.
+/// The search box uses it, so that an operator entry leaves the engine
+/// pending for its motion, exactly like typing the operator would.
+pub fn feedKeys(keys: []const keymod.Key) void {
+    const b = bindings orelse return;
+    clearPending();
+    for (keys) |k| _ = pushKey(b, active_ctx, k, false);
+}
+
+/// The binding tables, for the search index.
+pub fn tables() ?*const builder.BindingTables {
+    const b = bindings orelse return null;
+    return &b.tables;
 }
 
 test {

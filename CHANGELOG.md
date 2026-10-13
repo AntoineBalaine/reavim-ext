@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Doubled track operators**: a single-key track operator typed twice applies to the current track only (`MM` mute, `SS` solo, `dd` cut, `yy` copy, `aa` arm, …). Explicit bindings for a doubled sequence (e.g. `zz`, `ss`) keep priority. The whichkey offers the repeated key after an operator.
+- **Search keys & commands** (`<space>/`): a search box at the top of the whichkey window lists every binding usable in the current context and mode, filtered by the words you type (matched against keys, action names and descriptions). Typing is captured by vim, so the arrange view keeps focus; Up/Down or `<C-n>`/`<C-p>` select, Enter runs the binding as if its keys were typed (an operator then waits for its motion), Esc closes. The box also works by clicking it with the mouse
+- **Batch rename** (`<space>tb`, or the REAPER action `ReaVim: Batch rename selected tracks in editor`): the selected tracks' names open in vim, one per line, in a new terminal window; saving and quitting renames the tracks in one undo step, and `:cq` cancels. The editor defaults to your `$VISUAL` / `$EDITOR` (vim fallback), and on macOS the Terminal.app window closes by itself after the editor exits. The terminal, editor and auto-close are set in the new `[rename]` section of `bindings.ini`
+- **Whichkey focus handoff**: keys typed while the whichkey window has focus move focus back to the arrange view and run there, instead of being silently swallowed
+
+### Fixed
+- `t` (`CurrentTrack`) was an empty placeholder, so `Mt` and similar applied the operator to the whole track selection; it now selects only the current track
+
+### Changed
+- The `dd`, `yy` and `aa` command bindings are removed from the defaults: they now go through the doubled-operator rule and act on the current track only, instead of on every selected track
+
 ## [v0.1.3]
 
 ### Fixed
